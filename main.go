@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-var mu sync.RWMutex
+var mu sync.Mutex
 
 type statusRecorder struct {
 	http.ResponseWriter
@@ -29,7 +29,7 @@ const PASSWORD string = "admin"
 func main() {
 	mux := http.NewServeMux()
 
-	mux.Handle("GET /", loggingMiddleware(authMiddleware(rateLimitingMiddleware(http.FileServer(http.Dir("./public"))))))
+	mux.Handle("/", loggingMiddleware(corsMiddleware(rateLimitingMiddleware(authMiddleware(http.FileServer(http.Dir("./public")))))))
 
 	ticker := time.NewTicker(time.Minute)
 
@@ -45,7 +45,7 @@ func main() {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		log.Println(req.URL.Path, "executing logging middleware")
+		log.Println(req.URL.Path, "Initializing logging middleware")
 		start := time.Now()
 
 		recorder := &statusRecorder{
@@ -87,19 +87,35 @@ func rateLimitingMiddleware(next http.Handler) http.Handler {
 			registeredIps[userIp] = 0
 		}
 
-		log.Println(userIp)
-
-		registeredIps[userIp] += 1
+		registeredIps[userIp]++
+		count := registeredIps[userIp]
 
 		mu.Unlock()
 
-		if registeredIps[userIp] > REQUESTS_LIMIT_PER_MINUTE {
-			log.Printf("USER BLOCKED: %s %d requests in the last minute", userIp, registeredIps[userIp])
+		if count > REQUESTS_LIMIT_PER_MINUTE {
+			log.Printf("USER BLOCKED: %s %d requests in the last minute", userIp, count)
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
 
-		log.Printf("User %s has requested server %d time(s) in the last minute", userIp, registeredIps[userIp])
+		log.Printf("User %s has requested server %d time(s) in the last minute", userIp, count)
+
+		next.ServeHTTP(w, req)
+	})
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		log.Println("Initializing CORS headers")
+
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization")
+
+		if req.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 
 		next.ServeHTTP(w, req)
 	})
