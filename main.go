@@ -3,8 +3,12 @@ package main
 import (
 	"log"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
+
+var mu sync.RWMutex
 
 type statusRecorder struct {
 	http.ResponseWriter
@@ -16,13 +20,24 @@ func (sr *statusRecorder) WriteHeader(code int) {
 	sr.ResponseWriter.WriteHeader(code)
 }
 
+var registeredIps map[string]int = make(map[string]int)
+
+const REQUESTS_LIMIT_PER_MINUTE = 100
 const USERNAME string = "user"
 const PASSWORD string = "admin"
 
 func main() {
 	mux := http.NewServeMux()
 
-	mux.Handle("GET /", loggingMiddleware(authMiddleware(http.FileServer(http.Dir("./public")))))
+	mux.Handle("GET /", loggingMiddleware(authMiddleware(rateLimitingMiddleware(http.FileServer(http.Dir("./public"))))))
+
+	ticker := time.NewTicker(time.Minute)
+
+	go func() {
+		for range ticker.C {
+			resetRequestCount()
+		}
+	}()
 
 	log.Println("Listening on :8080...")
 	log.Fatal(http.ListenAndServe("127.0.0.1:8080", mux))
@@ -57,4 +72,45 @@ func authMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, req)
 	})
+}
+
+func rateLimitingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		mu.Lock()
+
+		log.Println("Logging IP and checking request count in last minute")
+
+		userIp := strings.Split(req.RemoteAddr, ":")[0]
+		_, ok := registeredIps[userIp]
+
+		if !ok {
+			registeredIps[userIp] = 0
+		}
+
+		log.Println(userIp)
+
+		registeredIps[userIp] += 1
+
+		mu.Unlock()
+
+		if registeredIps[userIp] > REQUESTS_LIMIT_PER_MINUTE {
+			log.Printf("USER BLOCKED: %s %d requests in the last minute", userIp, registeredIps[userIp])
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+
+		log.Printf("User %s has requested server %d time(s) in the last minute", userIp, registeredIps[userIp])
+
+		next.ServeHTTP(w, req)
+	})
+}
+
+func resetRequestCount() {
+	log.Println("Reseting request counts")
+	mu.Lock()
+	defer mu.Unlock()
+
+	for ip := range registeredIps {
+		delete(registeredIps, ip)
+	}
 }
