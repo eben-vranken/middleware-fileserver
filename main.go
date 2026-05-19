@@ -16,6 +16,9 @@ func (sr *statusRecorder) WriteHeader(code int) {
 	sr.ResponseWriter.WriteHeader(code)
 }
 
+const USERNAME string = "user"
+const PASSWORD string = "admin"
+
 func main() {
 	mux := http.NewServeMux()
 
@@ -43,7 +46,15 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		log.Println("Here we will authenticate the user")
+		log.Println("Authenticating user")
+		username, password, ok := req.BasicAuth()
+
+		if !ok || username != USERNAME || password != PASSWORD {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
 		next.ServeHTTP(w, req)
 	})
 }
