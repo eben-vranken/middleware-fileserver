@@ -1,194 +1,47 @@
-# 1.3 — Middleware File Server
+# Middleware File Server
 
-A static file server with a stack of middleware wrapped around it: structured request logging, basic auth, per-IP rate limiting, and CORS (with preflight handling). The file server itself is `http.FileServer` — three lines. The point of the project is the middleware.
-
-This is project **1.3** of my Go learning track — the last project of Phase 1 (HTTP with the standard library, no frameworks). Pairs with project 1.2 as the first "real" portfolio piece.
-
-## How it works
-
-A request flows through four wrappers before reaching the file server, and back out again:
+A static file server with a stack of middleware wrapped around it: structured request logging, basic auth, per-IP rate limiting, and CORS (with preflight handling). The file server itself is `http.FileServer` — three lines. The point is the middleware.
 
 ```
 request → [logging] → [CORS] → [rateLimit] → [auth] → fileServer → response
 ```
 
-Each middleware is a function that takes an `http.Handler` and returns a new `http.Handler`. The returned handler does work *around* a call to `next.ServeHTTP(w, req)` — that's the entire mechanism. The outer-to-inner order is set by how the handlers are nested in `main`:
-
-```go
-mux.Handle("/", loggingMiddleware(
-    corsMiddleware(
-        rateLimitingMiddleware(
-            authMiddleware(
-                http.FileServer(http.Dir("./public")),
-            ),
-        ),
-    ),
-))
-```
-
-The mux uses the pattern `"/"` (no method prefix) so that `OPTIONS` preflight requests reach the CORS middleware. A `GET /` pattern would 405 the preflight before any middleware runs.
-
-### Logging — status code interception
-
-Logging needs the response status code, but `http.ResponseWriter` is write-only: it has `WriteHeader(code int)` for *setting* the status, but no method for *reading* what was set. The fix is to wrap the writer in a struct that records the code as it passes through:
-
-```go
-type statusRecorder struct {
-    http.ResponseWriter
-    statusCode int
-}
-
-func (sr *statusRecorder) WriteHeader(code int) {
-    sr.statusCode = code
-    sr.ResponseWriter.WriteHeader(code)
-}
-```
-
-Embedding `http.ResponseWriter` means the recorder satisfies the interface for free — every method except `WriteHeader` forwards to the embedded writer. The override on `WriteHeader` snoops the code, then delegates.
-
-**The pointer receiver matters.** `func (sr *statusRecorder) WriteHeader` is in the method set of `*statusRecorder`, not `statusRecorder` value. If the middleware passes the recorder as a value, Go's interface dispatch picks the embedded writer's `WriteHeader` and the snoop never fires. So the middleware constructs `recorder := &statusRecorder{...}` and passes the pointer to `next.ServeHTTP(recorder, req)`.
-
-Once that's set up, the recorder propagates all the way down the chain — auth, rate limit, and the file server all see the recorder as their `w`. Any `WriteHeader(401)` or `WriteHeader(404)` anywhere downstream gets captured automatically.
-
-The status field is initialized to `http.StatusOK` so handlers that never call `WriteHeader` explicitly (and Go defaults to 200 if you go straight to `Write`) still log correctly.
-
-### CORS — preflight is the part that bites
-
-The middleware sets three response headers on every request:
-
-```
-Access-Control-Allow-Origin:  *
-Access-Control-Allow-Methods: GET
-Access-Control-Allow-Headers: Authorization
-```
-
-`Authorization` has to be in `Allow-Headers` because the file server is behind basic auth, and a request carrying an `Authorization` header is "non-simple" by CORS rules. That triggers a **preflight**: the browser sends an `OPTIONS` to the same URL first, asking whether the real request will be allowed.
-
-The middleware handles preflight explicitly:
-
-```go
-if req.Method == http.MethodOptions {
-    w.WriteHeader(http.StatusNoContent)   // 204
-    return                                 // do NOT call next
-}
-```
-
-The preflight has no business hitting the file server, the rate limiter, or auth — it's a permission check. So the middleware short-circuits and returns 204.
-
-CORS sits outside auth in the chain on purpose. A preflight request has no `Authorization` header (the browser only attaches it on the real request). If auth ran first, every preflight would return 401, the browser would block the real request, and the server would look broken from the outside.
-
-### Rate limiting — fixed window, per IP, with a ticker reset
-
-State is a `map[string]int` keyed by client IP. Each request increments its IP's counter under a `sync.Mutex`. If the counter exceeds the per-minute limit, the middleware returns 429 and does not call `next`. A background goroutine started in `main` fires a `time.Ticker` every minute and wipes the map:
-
-```go
-ticker := time.NewTicker(time.Minute)
-go func() {
-    for range ticker.C {
-        resetRequestCount()
-    }
-}()
-```
-
-The interesting parts are concurrency:
-
-**Snapshot under the lock.** The handler increments the counter, copies the value into a local, then unlocks — and uses the local for the limit check and the log message. It never touches the map after `Unlock()`.
-
-```go
-mu.Lock()
-registeredIps[userIp]++
-count := registeredIps[userIp]
-mu.Unlock()
-
-if count > REQUESTS_LIMIT_PER_MINUTE { ... }
-```
-
-The earlier draft released the write lock and then re-acquired a read lock to read the count. That was wrong in two ways: the read lock could leak on the rate-limited return path (no `defer`), and the gap between the two locks was a TOCTOU window — the ticker could wipe the map between the increment and the re-read. Capturing into a local eliminates both problems. After `Unlock`, the local is yours regardless of what happens to the map.
-
-**Plain `sync.Mutex` is enough.** RWMutex is only useful when many goroutines just want to read. Here every request *writes* (increment is a map write), so the read lock would never be the path actually taken. Plain mutex, no overhead.
-
-**Reset locks too.** The ticker goroutine also calls `mu.Lock()` / `defer mu.Unlock()` while iterating the map. Otherwise the writer and the readers (which are also writers) collide and Go's race detector flags it.
-
-This is a **fixed-window** limiter — counters reset for everyone at the same global tick. So a client can request `LIMIT` times right before the tick and `LIMIT` more right after, for `2×LIMIT` requests in two seconds. Sliding-window and token-bucket limiters fix this, but the ticker approach is what the roadmap was asking for and it's the simplest thing that works.
-
-### Auth — `r.BasicAuth()` plus the realm header
-
-Basic auth is one method call away:
-
-```go
-username, password, ok := req.BasicAuth()
-if !ok || username != USERNAME || password != PASSWORD {
-    w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-    w.WriteHeader(http.StatusUnauthorized)
-    return
-}
-next.ServeHTTP(w, req)
-```
-
-`r.BasicAuth` decodes the `Authorization` header for you. `ok` is `false` when the header is missing or malformed — which is the *normal* state of the first request from a browser, not an error. Treating it the same as wrong credentials and responding 401 (not 400) is correct.
-
-**The `WWW-Authenticate` header is the part that triggers the browser dialog.** Without it, the browser sees a bare 401 and just gives up — no prompt. With `WWW-Authenticate: Basic realm="..."`, the browser pops up the username/password dialog, attaches credentials to the retry, and caches them for the rest of the session. The realm string is just a label shown in the dialog.
-
-**Header order: set headers before calling `WriteHeader`.** Once `WriteHeader` is called, headers are flushed and can't be changed. The middleware sets `WWW-Authenticate` first, *then* writes 401.
-
-The constant-credential check is vulnerable to timing attacks (`!=` on strings short-circuits at the first mismatched byte). For a real auth path I'd use `subtle.ConstantTimeCompare`. Out of scope here — the credentials are hardcoded and the goal is the mechanism, not the security posture.
-
-### Middleware order is a design decision
-
-Each layer's placement matters:
-
-- **Logging** is outermost so it sees every request, including ones rejected by inner middleware (auth 401s, rate-limited 429s). If logging were inside, rejected requests would be invisible.
-- **CORS** is next because preflight `OPTIONS` requests have no auth header and would 401 if auth ran first.
-- **Rate limit** before **auth** so an attacker brute-forcing the password can't make unlimited attempts. With the reverse order, only authenticated users are rate-limited and the auth check itself is wide open.
-
-## How to run it
+## How to use
 
 ```sh
 go run .
 ```
 
-Server listens on `127.0.0.1:8080`. The `public/` directory holds the files being served (an `index.html`, a `.txt`, an audio sample — whatever's there).
-
-### Trying it out
+Server listens on `127.0.0.1:8080`. The `public/` directory holds the served files.
 
 ```sh
 # Without credentials → 401 with WWW-Authenticate
 $ curl -i http://localhost:8080/index.html
-HTTP/1.1 401 Unauthorized
-WWW-Authenticate: Basic realm="Restricted"
 
 # With credentials → the file
 $ curl -u user:admin http://localhost:8080/index.html
 
-# In a browser, visiting http://localhost:8080/ pops up the basic auth dialog.
-
-# Hammer it to hit the limit
+# Hit the rate limit
 $ for i in $(seq 1 150); do curl -s -o /dev/null -u user:admin http://localhost:8080/; done
-# ...eventually starts returning 429.
 
-# Trigger CORS preflight directly
+# Trigger a CORS preflight directly
 $ curl -i -X OPTIONS http://localhost:8080/index.html \
     -H "Origin: http://example.com" \
     -H "Access-Control-Request-Method: GET" \
     -H "Access-Control-Request-Headers: authorization"
-HTTP/1.1 204 No Content
-Access-Control-Allow-Origin:  *
-Access-Control-Allow-Methods: GET
-Access-Control-Allow-Headers: Authorization
 ```
 
 ## What I learned
 
-- **Middleware is just function composition.** A middleware takes an `http.Handler` and returns an `http.Handler`. The returned handler does its own thing and then calls `next.ServeHTTP(w, req)`. Stacking them is nesting function calls. No framework concepts, no decorators, no DI container — just functions returning functions.
-- **Anything that satisfies `http.Handler` is interchangeable.** `http.FileServer(...)`, `http.HandlerFunc(myFn)`, a chi router, an embedded type — they're all the same shape and all wrappable by the same middleware. That's the actual reason the standard library doesn't need a framework.
-- **`http.ResponseWriter` is write-only.** No `StatusCode()`, no `Body()`. To observe the status, wrap the writer in a struct that overrides `WriteHeader` to record the code. To observe the body, override `Write`. The pattern is universal — every Go logging/metrics middleware does some version of this.
-- **Pointer vs value receivers are in the method set.** A method declared on `*T` is in the method set of `*T`, not `T`. So embedding an interface and overriding a method with a pointer receiver only takes effect if the surrounding code holds a pointer. Passing the value would silently fall back to the embedded method.
-- **Snapshot under the lock.** The trick to releasing the lock as early as possible is to copy the shared data into a local variable *before* unlocking, then use the local for everything downstream. The lock is the only thing protecting the read; once it's gone, the read isn't safe anymore.
-- **`defer mu.Unlock()` matters for early returns.** Without `defer`, every `return` branch has to remember to unlock — and the rate-limit-exceeded branch already forgot once during this project. `defer` makes the unlock unforgettable.
-- **`time.Ticker` + a goroutine is the canonical "do something every X" pattern.** `for range ticker.C { ... }` consumes the tick channel forever. The work happens inline (or in its own function call) — wrapping it in another goroutine is unnecessary unless the work itself is slow and you want overlapping invocations.
-- **`for { select { case <-ch: ... } }` with a single case is a `for range ch`.** Staticcheck rule S1000. `select` is for *choosing between* channels; with one option there's nothing to choose.
-- **Browsers trigger basic auth dialogs on `401` + `WWW-Authenticate`.** Either header alone does nothing. The combination is the spec-defined signal, and every browser implements it. Sending 401 without the header just looks like a broken server.
-- **CORS preflight is the part that catches you out.** Same-origin requests don't trigger it; same-origin testing in a browser will never exercise the middleware. The way to actually verify CORS is direct OPTIONS requests with curl, or a `fetch()` from a different-origin page in devtools. The `Authorization` header is one of the things that triggers preflight, so any API behind basic auth has to handle it.
-- **Middleware order is a design decision, not an afterthought.** Logging wants to see everything (outside). Auth wants CORS preflight to pass through (CORS outside auth). Rate limiting wants to stop brute-force attempts (rate limit before auth). The chain isn't arbitrary; each layer's position has security and observability consequences.
-- **Fixed-window rate limiting is the simplest thing that works.** It has a known weakness at the edges of the window, but it's two functions and a ticker. The next steps up the ladder — sliding window, token bucket, leaky bucket — exist for reasons but aren't worth the complexity for a learning project.
-- **Concurrency in Go is "free" until it isn't.** `net/http` runs every request in its own goroutine without asking. Any shared state — a map of IP counts, a map of books — needs protection. The runtime's race detector turns the silent bugs into visible panics. The discipline is: identify your shared state, decide on a locking strategy, and stick to it.
+- **Middleware is just function composition.** A middleware takes an `http.Handler` and returns one that does work around a call to `next.ServeHTTP`. Stacking is nested function calls — no framework, no DI container.
+- **Anything that satisfies `http.Handler` is interchangeable.** `http.FileServer`, `http.HandlerFunc`, a router, an embedded type — same shape, same wrappers.
+- **`http.ResponseWriter` is write-only.** No `StatusCode()`, no `Body()`. To observe the status, wrap the writer in a struct that overrides `WriteHeader`. Every Go logging middleware does some version of this.
+- **Pointer vs value receivers are in the method set.** A method on `*T` is only in the method set of `*T`. Pass the wrapper as a pointer or the override silently falls back to the embedded method.
+- **Snapshot under the lock.** Copy shared data into a local *before* unlocking, then use the local downstream. Releasing the lock and re-acquiring it leaves a TOCTOU window.
+- **`defer mu.Unlock()` matters for early returns.** Without `defer`, every error branch has to remember to unlock — and one of them will eventually forget.
+- **`time.Ticker` + a goroutine is the canonical "do something every X".** `for range ticker.C { ... }` consumes the channel forever. Wrapping the work in another goroutine is unnecessary unless it's slow.
+- **Browsers trigger basic auth dialogs on `401` + `WWW-Authenticate`.** Either alone does nothing. The combination is the spec-defined signal.
+- **CORS preflight is the part that catches you out.** Same-origin testing never exercises the middleware. An `Authorization` header triggers a preflight `OPTIONS`, which has no creds — so CORS must sit *outside* auth in the chain.
+- **Middleware order is a design decision.** Logging outermost (sees everything). CORS outside auth (preflight passes through). Rate limit before auth (so brute-force attempts are throttled).
+- **Constant-time compare for credentials.** Plain `!=` on strings short-circuits at the first mismatched byte — a timing leak. Real auth uses `subtle.ConstantTimeCompare`.
+- **Fixed-window rate limiting is the simplest thing that works.** Has a known edge-of-window weakness (`2×LIMIT` requests in two seconds), but it's two functions and a ticker. Sliding window and token bucket exist for reasons but aren't worth it here.
